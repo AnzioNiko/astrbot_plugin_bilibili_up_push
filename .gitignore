@@ -1,0 +1,77 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Virtual environments
+.env
+.env.*
+.venv/
+venv/
+env/
+
+# AstrBot plugin runtime data
+data/
+plugin_data/
+cache/
+cookies/
+logs/
+video_cache/
+bili_cookies.json
+*cookie*.json
+*credential*.json
+credential*.json
+subscriptions.json
+login_qr_*.png
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.tmp
+
+# Local settings
+config.json
+config.yaml
+config.yml
+astrbot_plugin_bilibili_up_push_config.json
+*.local.json
+*.local.yaml
+*.local.yml
+local/
+.local/
+
+# Secrets and credentials
+secrets/
+*.secret
+*.secret.*
+*secret*.json
+*password*.json
+*token*.json
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+.npmrc
+.pypirc
+
+# Logs and temporary files
+*.log
+*.bak
+*.swp
+*~
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini
