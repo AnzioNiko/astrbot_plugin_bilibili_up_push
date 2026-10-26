@@ -13,6 +13,7 @@ import tempfile
 import time
 import urllib.parse
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +24,12 @@ from astrbot.api.message_components import Image, Plain
 from astrbot.core.message.components import Video
 from astrbot.api.star import Context, Star, StarTools
 from astrbot.core.message.message_event_result import MessageChain
+
+from .error_utils import (
+    format_exception_detail,
+    format_video_file_error,
+    normalize_retry_times,
+)
 
 
 PLUGIN_ID = "astrbot_plugin_bilibili_up_push"
@@ -38,6 +45,9 @@ QR_GENERATE_API = f"{PASSPORT_BASE}/x/passport-login/web/qrcode/generate"
 QR_POLL_API = f"{PASSPORT_BASE}/x/passport-login/web/qrcode/poll"
 POLL_INTERVAL_SECONDS = 900
 VIDEO_BATCH_SIZE = 10
+DEFAULT_PUSH_RETRY_TIMES = 2
+MAX_PUSH_RETRY_TIMES = 10
+PUSH_RETRY_INTERVAL_SECONDS = 2.0
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
@@ -58,6 +68,11 @@ class BiliUpPushPlugin(Star):
         self.context = context
         self.config = config or {}
         self.send_video_file = bool(self.config.get("send_video_file", True))
+        self.push_retry_times = normalize_retry_times(
+            self.config.get("push_retry_times", DEFAULT_PUSH_RETRY_TIMES),
+            default=DEFAULT_PUSH_RETRY_TIMES,
+            maximum=MAX_PUSH_RETRY_TIMES,
+        )
         self.data_dir = Path(StarTools.get_data_dir(PLUGIN_ID))
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.state_path = self.data_dir / "subscriptions.json"
@@ -722,89 +737,81 @@ class BiliUpPushPlugin(Star):
     async def _send_notification_messages(
         self, origin: str, name: str, video: dict[str, str]
     ) -> tuple[bool, bool]:
-        """先单发视频信息；成功后直接单发视频文件，失败时单发错误原因。"""
+        """先发送视频信息，再按配置发送视频文件；错误仅记录到日志。"""
         message = self._format_video_message(name, video)
-        sent = await self.context.send_message(origin, MessageChain([Plain(message)]))
-        if sent is False:
+        sent = await self._send_message_with_retry(
+            origin,
+            lambda: MessageChain([Plain(message)]),
+            "视频文字通知",
+        )
+        if not sent:
             return False, False
         if not self.send_video_file:
             return True, False
 
-        try:
-            video_path = await self._get_video_path_from_parser(video["bvid"])
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            logger.warning(
-                f"[BiliUPPush] 获取视频文件失败 BV={video.get('bvid', '')}: {exc}"
-            )
-            await self._send_notification_status(
-                origin,
-                self._safe_error_detail(exc),
-            )
+        video_path = await self._get_video_path_with_retry(video["bvid"])
+        if video_path is None:
             return True, False
 
-        try:
-            sent = await self.context.send_message(
-                origin, MessageChain([Video.fromFileSystem(str(video_path))])
-            )
-            if sent is False:
-                raise RuntimeError("发送接口返回失败")
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            logger.warning(
-                f"[BiliUPPush] 发送视频文件失败 BV={video.get('bvid', '')}: {exc}"
-            )
-            await self._send_notification_status(
-                origin,
-                self._safe_error_detail(exc),
-            )
-            return True, False
-        return True, True
-
-    async def _send_notification_status(self, origin: str, message: str) -> bool:
-        """单独发送附件处理状态；状态发送失败不阻断视频处理。"""
-        try:
-            sent = await self.context.send_message(
-                origin, MessageChain([Plain(message)])
-            )
-            if sent is False:
-                logger.warning("[BiliUPPush] 视频文件状态消息发送失败")
-                return False
-            return True
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            logger.warning(f"[BiliUPPush] 视频文件状态消息发送异常: {exc}")
-            return False
-
-    @staticmethod
-    def _safe_error_detail(exc: Exception) -> str:
-        """给群消息展示错误原因，同时隐藏签名地址、凭据和本机路径。"""
-        if isinstance(exc, OSError):
-            code = getattr(exc, "winerror", None) or exc.errno
-            detail = exc.strerror or "本地文件操作失败"
-            code_text = f"WinError {code}" if getattr(exc, "winerror", None) else f"错误码 {code}"
-            return f"{type(exc).__name__}（{code_text}）：{detail}"
-
-        if isinstance(exc, aiohttp.ClientResponseError):
-            host = ""
-            if exc.request_info is not None:
-                host = exc.request_info.real_url.host or ""
-            detail = f"HTTP {exc.status} {exc.message}".strip()
-            return f"{detail}（主机：{host}）" if host else detail
-
-        detail = str(exc)
-        detail = re.sub(r"https?://[^\s'\"<>]+", "[远程地址已隐藏]", detail)
-        detail = re.sub(r"(?i)\b[A-Z]:\\[^\s'\"<>]+", "[本机路径已隐藏]", detail)
-        detail = re.sub(
-            r"(?i)\b(?:SESSDATA|bili_jct|access_token|refresh_token|token|w_rid|sign)\s*[=:]\s*[^&\s,;]+",
-            "[凭据已隐藏]",
-            detail,
+        sent = await self._send_message_with_retry(
+            origin,
+            lambda: MessageChain([Video.fromFileSystem(str(video_path))]),
+            f"视频文件 BV={video['bvid']}",
         )
-        detail = detail[:500]
-        return f"{type(exc).__name__}: {detail}" if detail else type(exc).__name__
+        return True, sent
+
+    async def _send_message_with_retry(
+        self,
+        origin: str,
+        chain_factory: Callable[[], MessageChain],
+        label: str,
+    ) -> bool:
+        total_attempts = self.push_retry_times + 1
+        for attempt in range(1, total_attempts + 1):
+            try:
+                sent = await self.context.send_message(origin, chain_factory())
+                if sent is not False:
+                    if attempt > 1:
+                        logger.info(f"[BiliUPPush] {label} 第 {attempt} 次尝试发送成功")
+                    return True
+                logger.warning(
+                    f"[BiliUPPush] {label} 发送接口返回失败，"
+                    f"第 {attempt}/{total_attempts} 次"
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    f"[BiliUPPush] {label} 第 {attempt}/{total_attempts} 次发送失败: "
+                    f"{format_exception_detail(exc)}"
+                )
+            if attempt < total_attempts:
+                await asyncio.sleep(PUSH_RETRY_INTERVAL_SECONDS)
+        logger.error(
+            f"[BiliUPPush] {label} 在 {total_attempts} 次尝试后仍未发送成功"
+        )
+        return False
+
+    async def _get_video_path_with_retry(self, bvid: str) -> Path | None:
+        total_attempts = self.push_retry_times + 1
+        for attempt in range(1, total_attempts + 1):
+            try:
+                return await self._get_video_path_from_parser(bvid)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    f"[BiliUPPush] 获取视频文件失败 BV={bvid}，"
+                    f"第 {attempt}/{total_attempts} 次: "
+                    f"{format_video_file_error('parse', exc)}"
+                )
+                if attempt < total_attempts:
+                    await asyncio.sleep(PUSH_RETRY_INTERVAL_SECONDS)
+        logger.error(
+            f"[BiliUPPush] 获取视频文件失败 BV={bvid}，"
+            f"在 {total_attempts} 次尝试后放弃"
+        )
+        return None
 
     def _get_parser_plugin(self) -> Any:
         """获取万能解析器实例，并检查 PR #223 提供的公开解析接口。"""
